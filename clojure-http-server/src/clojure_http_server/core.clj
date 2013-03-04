@@ -1,120 +1,124 @@
 (ns clojure-http-server.core
- (:require [clojure.string])
- (:import (java.net ServerSocket SocketException )
-  (java.util Date)
-  (java.io File RandomAccessFile PrintWriter BufferedReader InputStreamReader BufferedOutputStream)))
+  (:require clojure.string)
+  (:import
+    java.util.Date
+    [java.net ServerSocket SocketException ]   
+    [java.io File RandomAccessFile PrintWriter BufferedReader InputStreamReader BufferedOutputStream]))
 
 (def web-root ".")
 (def default-file "index.html")
 
+(defn print-to-stream [client-socket byte-content & params] 
+  (let [out       (new BufferedOutputStream (.getOutputStream client-socket))
+        print-out (new PrintWriter out)] 
+    (doseq [param params] 
+      (.println print-out param))
+    (.println print-out)
+    (.flush print-out)
+    (.write out byte-content)
+    (.flush out)))
+
+
 (defn send-http-response 
- "Send data to client"
- [client-socket status content-type byte-content]
- (let
-  [out-stream (.getOutputStream client-socket) out (new BufferedOutputStream out-stream) print-out (new PrintWriter out)]
-  (do
-   (.println print-out status)
-   (.println print-out "Server: Clojure HTTP Server 1.0")
-   (.println print-out (new Date))
-   (.println print-out (str "Content-type: " content-type))
-   (.println print-out (str "Content-length " (count byte-content)))
-   (.println print-out)
-   (.flush print-out)
-   (.write out byte-content)
-   (.flush out)
-   (.close out-stream)
-  )))
+  "Send data to client"
+  [client-socket status content-type byte-content]
+  ;; with-open will close the stream for you
+  (print-to-stream client-socket 
+                   byte-content
+                   status
+                   "Server: Clojure HTTP Server 1.0"
+                   (new Date)
+                   (str "Content-type: " content-type)
+                   (str "Content-length " (count byte-content))))
 
 (defn send-html-response
- "Html response"
- [client-socket status title body]
+  "Html response"
+  [client-socket status title body]
  (let [html (str "<HTML><HEAD><TITLE>" title "</TITLE></HEAD><BODY>" body "</BODY></HTML>")]
-  (send-http-response client-socket status "text/html" (.getBytes html "UTF-8"))
- ))
+   (send-http-response client-socket status "text/html" (.getBytes html "UTF-8"))))
 
-
-(defn get-reader
- "Create a Java reader from the input stream of the client socket"
- [client-socket]
- (new BufferedReader (new InputStreamReader (.getInputStream client-socket))))
 
 (defn read-file
-"Reads a binary file into a buffer"
+  "Reads a binary file into a buffer"
 [file-to-read]
 (with-open [file (new RandomAccessFile file-to-read "r")]
-  (let [x (byte-array (.length file-to-read))]
-    (do
-    (.read file x)
-    x))))
+  (let [buffer (byte-array (.length file-to-read))]
+    (.read (clojure.java.io/input-stream file-to-read) buffer)
+    buffer)))
 
 (defn find-content-type
-"Simple file type mappings"
-[filename]
-(cond 
- (or (.endsWith filename ".html") (.endsWith filename ".htm")) "text/html"
- (.endsWith filename ".gif") "image/gif"
- (or (.endsWith filename ".jpg") (.endsWith filename ".jpeg")) "image/jpeg"
- (or (.endsWith filename ".class") (.endsWith filename ".jar")) "applicaton/octet-stream"
- :else "text/plain"))
+  "Simple file type mappings"
+  [filename]
+  (let [ext (.substring filename (.lastIndexOf filename ".") (count filename))] 
+    (or 
+      (-> #(some #{ext} (first %))         
+        (filter    
+          [[[".html" ".htm"] "text/html"]
+           [[".gif"] "image/gif"]
+           [[".jpg" ".jpeg"] "image/jpeg"]
+           [[".class" ".jar"] "applicaton/octet-stream"]])
+        first
+        second)
+      "text/plain")))
+
+(defn not-implemented [client-socket http-method]  
+  (send-html-response client-socket "HTTP/1.1 501 Not Implemented" "Not Implemented" (str "<h2>501 Not Implemented: " http-method " method.</h2>"))
+  (println "501 Not Implemented:" http-method "method"))
+
 
 (defn send-file
- "Reads a file from the file system and writes it to the socket"
- [client-socket file http-method retry]
- (let [is-dir (.isDirectory file)]
-  (if (and is-dir (not retry))
-   (send-file client-socket (new File file default-file) http-method true))
-  (if (and (.exists file) (not is-dir))
-   ( let [content (if (= http-method "GET") (read-file file) (byte-array 0)) content-type (find-content-type (.getName file))]
-     (do
-      (send-http-response client-socket "HTTP/1.0 200 OK" content-type content)
-      (println (str "File " (.getPath file) " of type " content-type " returned")
-      )))
-   (do
-    (send-html-response client-socket "HTTP/1.1 501 Not Found" "File Not Found" (str "<h2>404 File Not Found: " (.getPath file) "</h2>"))
-    (println (str "501 Not Implemented: " http-method " method")))
-  )))
+  "Reads a file from the file system and writes it to the socket"
+  [client-socket file http-method retry]
+  (let [dir? (.isDirectory file)]    
+    (cond    
+      (not= http-method "GET") 
+      (not-implemented client-socket http-method)
+      
+      (not (.exists file)) 
+      (send-html-response client-socket "HTTP/1.1 404 Not Found" "Found" (str "<h2>404 Not Found: " (.getName file) "</h2>"))
+
+      (and dir? (not retry))
+      (send-file client-socket (new File file default-file) http-method true)
+      
+      :else
+      (let [content (read-file file) 
+            content-type (find-content-type (.getName file))]
+        (send-http-response client-socket "HTTP/1.0 200 OK" content-type content)
+        (println "File" (.getPath file) "of type" content-type "returned")))))
 
 (defn process-request
- "Parse the HTTP request and decide what to do"
- [client-socket]
- (let [reader (get-reader client-socket) first-line (.readLine reader) tokens (clojure.string/split first-line #"\s+")]
-  (let [http-method (clojure.string/upper-case (get tokens 0 "unknown"))]
-   (if (or (= http-method "GET") (= http-method "HEAD"))
-   (let [file-requested-name (get tokens 1 "not-existing") 
-   file-requested 
-   (new File web-root file-requested-name)]
-    (send-file client-socket file-requested http-method false)
-    )
-
-    (do
-     (send-html-response client-socket "HTTP/1.1 501 Not Implemented" "Not Implemented" (str "<h2>501 Not Implemented: " http-method " method.</h2>"))
-     (println (str "501 Not Implemented: " http-method " method")))
-   )
-
-  )))
+  "Parse the HTTP request and decide what to do"
+  [client-socket]
+  (let [reader     (clojure.java.io/reader client-socket) 
+        first-line (.readLine reader) 
+        tokens     (if first-line (clojure.string/split first-line #"\s+"))]
+    (println "line" first-line "tokens" tokens)
+    (let [http-method (clojure.string/upper-case (get tokens 0 "unknown"))]      
+      (if (or (= http-method "GET") (= http-method "HEAD"))
+        (let [file-requested-name (get tokens 1 "not-existing") 
+              file-requested (new File web-root file-requested-name)]
+          (send-file client-socket file-requested http-method false))        
+        (not-implemented client-socket http-method)) )))
 
 
 (defn respond-to-client 
- "A new http client is connected. Process the request" [client-socket]
- (do (println "A client has connected" (new Date))
-  (process-request client-socket)
-  (.close client-socket)
-  (println "Connection closed")))
+  "A new http client is connected. Process the request" 
+  [server-socket]
+  (println "A client has connected" (new Date))
+  (with-open [client-socket (.accept server-socket)]
+    (process-request client-socket))  
+  (println "Connection closed"))
 
 (defn new-worker
-"Spawn a new thread"
-[client-socket]
-(.start (new Thread (fn [] (respond-to-client client-socket)))))
-
+  "Spawn a new thread"
+  [server-socket]
+  (.start (new Thread (fn [] (respond-to-client server-socket)))))
 
 (defn -main
- "The main method that runs via lein run"
- []
- (let [port 8080 server-socket (new ServerSocket port)]
-  (do 
-   (println (str "Listening for connections on port " port))
-   (while true
-   (let [client-socket (.accept server-socket)]
-   (new-worker client-socket))))))
-
-
+  "The main method that runs via lein run"
+  []
+  (let [port 8080 
+        server-socket (new ServerSocket port)]    
+    (println "Listening for connections on port" port)
+    (while true
+      (new-worker server-socket))))
