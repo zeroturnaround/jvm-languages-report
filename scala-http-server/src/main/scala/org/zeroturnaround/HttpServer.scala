@@ -19,9 +19,10 @@ object HttpServer {
     println(s"\nListening for connections on port ${port}...\n")
 
     val pool = concurrent.Executors.newCachedThreadPool()
-    
-    while(true)
+
+    while(true) {
       pool.execute(new HttpServer(serverSocket.accept()))
+    }
   }
 
 }
@@ -32,7 +33,7 @@ class HttpServer(socket: Socket) extends Runnable {
 
   def run() {
     println(s"Connection opened. (${new Date()})")
-    
+
     val source = io.Source.fromInputStream(socket.getInputStream(), Encoding)
     try {
       val line = source.getLines.next
@@ -44,16 +45,16 @@ class HttpServer(socket: Socket) extends Runnable {
           sendFile(path, method)
 
         case method =>
-          respondWithHtml(
-            Status(501, "Not Implemented"),
-            title = "501 Not Implemented",
-            body = <H2>501 Not Implemented: { method } method</H2>
-          )
+          respondWithHtmlError(Status(501, "Not Implemented"))
           println(s"501 Not Implemented: ${method} method.")
       }
-    } finally
+    } catch {
+      case e: Exception =>
+        respondWithHtmlError(Status(400, "Bad Request"))
+        println(s"400 Bad Request.")
+    } finally {
       source.close()
-
+    }
   }
 
   def respond(status: Status, contentType: String = "text/html", content: Array[Byte]) {
@@ -78,7 +79,7 @@ class HttpServer(socket: Socket) extends Runnable {
     }
   }
 
-  def respondWithHtml(status: Status, title: String, body: xml.NodeSeq) =
+  def respondWithHtml(status: Status, title: String, body: xml.NodeSeq): Unit =
     respond(
       status = status,
       content = xml.Xhtml.toXhtml(
@@ -91,7 +92,15 @@ class HttpServer(socket: Socket) extends Runnable {
       ).getBytes(Encoding)
     )
 
-  def sendFile(path: String, method: String) = toFile(path) match {
+  def respondWithHtmlError(status: Status): Unit = {
+    require(status.code >= 400 && status.code < 600,
+      s"Not an HTTP error code: ${status.code}")
+    respondWithHtml(status,
+      title = s"${status.code} ${status.text}",
+      body = <H2>{ status.code } { status.text }</H2>)
+  }
+
+  def sendFile(path: String, method: String): Unit = toFile(path) match {
     case Some(file) =>
       val content = if ("GET" == method) {
         val bytesOut = new ByteArrayOutputStream()
@@ -103,28 +112,16 @@ class HttpServer(socket: Socket) extends Runnable {
         val fileExt = file.getName.split('.').lastOption getOrElse ""
         getContentType(fileExt)
       }
-      respond(
-        Status(200, "OK"),
-        contentType,
-        content
-      )
+      respond(Status(200, "OK"), contentType, content)
       println(s"File ${file.getPath} of type ${contentType} returned.")
     case None =>
-      respondWithHtml(
-        Status(404, "Not Found"),
-        title = "404 File Not Found",
-        body = <H2>404 File Not Found: {path}</H2>
-      )
+      respondWithHtmlError(Status(404, "Not Found"))
       println(s"404 File Not Found: ${path}")
   }
 
   def toFile(path: String): Option[File] =
     if (path contains "..") {
-      respondWithHtml(
-        Status(403, "Forbidden"),
-        title = "403 Forbidden",
-        body = <H2>403 Forbidden: .. in path not allowed: {path}</H2>
-      )
+      respondWithHtmlError(Status(403, "Forbidden"))
       println(s"403 Forbidden: .. in path not allowed: ${path}")
       throw new SecurityException(s".. in path not allowed: ${path}")
     } else
@@ -138,7 +135,7 @@ class HttpServer(socket: Socket) extends Runnable {
     else
       None
 
-  def getContentType(extension: String) = extension match {
+  def getContentType(extension: String): String = extension match {
     case "htm" | "html"  => "text/html"
     case "gif"           => "image/gif"
     case "jpg" | "jpeg"  => "image/jpeg"
